@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+scikit-learn
+numpy
+pandas
+httpx
+beautifulsoup4
+vaderSentiment
+google-genai
+lxml
