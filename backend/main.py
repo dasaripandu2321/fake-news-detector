@@ -3,19 +3,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
 from bs4 import BeautifulSoup
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LogisticRegression
-from sklearn.pipeline import Pipeline
-import joblib
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from google import genai as google_genai
-import numpy as np
 import re
 import json
 import hashlib
-import pandas as pd
+import math
+import csv
 from pathlib import Path
 from urllib.parse import urlparse
+from collections import defaultdict
 
 app = FastAPI(title="Fake News Detector API")
 
@@ -36,17 +33,15 @@ CREDIBLE_DOMAINS = {
     "bloomberg.com", "economist.com", "ft.com", "time.com", "forbes.com",
     "nature.com", "science.org", "scientificamerican.com", "newscientist.com",
     "pbs.org", "cbsnews.com", "nbcnews.com", "abcnews.go.com", "cnn.com",
-    "politico.com", "thehill.com", "axios.com", "vox.com", "slate.com",
-    "theatlantic.com", "newyorker.com", "usatoday.com", "latimes.com",
-    "chicagotribune.com", "bostonglobe.com", "sfchronicle.com",
-    "independent.co.uk", "telegraph.co.uk", "thetimes.co.uk",
-    "dw.com", "france24.com", "aljazeera.com", "euronews.com",
-    "who.int", "cdc.gov", "nih.gov", "nasa.gov", "un.org",
-    "factcheck.org", "snopes.com", "politifact.com", "fullfact.org",
+    "politico.com", "thehill.com", "axios.com", "vox.com", "theatlantic.com",
+    "newyorker.com", "usatoday.com", "latimes.com", "independent.co.uk",
+    "dw.com", "france24.com", "aljazeera.com", "who.int", "cdc.gov",
+    "nih.gov", "nasa.gov", "un.org", "factcheck.org", "snopes.com",
+    "politifact.com", "fullfact.org",
 }
 
 # ---------------------------------------------------------------------------
-# Bias / sensational keyword list
+# Bias / sensational keywords
 # ---------------------------------------------------------------------------
 BIAS_KEYWORDS = {
     "shocking", "secret", "exposed", "miracle", "conspiracy", "leaked",
@@ -57,7 +52,6 @@ BIAS_KEYWORDS = {
     "fake", "rigged", "stolen", "corrupt", "agenda", "propaganda",
 }
 
-# Strong factual language markers
 FACTUAL_MARKERS = [
     "according to", "said", "reported", "announced", "percent", "study",
     "research", "official", "government", "university", "published",
@@ -69,91 +63,112 @@ FACTUAL_MARKERS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Model — train once, save to disk, reload on subsequent boots (saves RAM/CPU)
+# Tiny Naive Bayes — trains in <1s, uses <30MB RAM
 # ---------------------------------------------------------------------------
-DATA_PATH  = Path(__file__).parent / "data" / "fake_or_real_news.csv"
-MODEL_PATH = Path(__file__).parent / "model.pkl"
+DATA_PATH = Path(__file__).parent / "data" / "fake_or_real_news.csv"
 
-def _load_training_data():
-    if DATA_PATH.exists():
-        df = pd.read_csv(DATA_PATH)
-        texts = (df["title"].fillna("") + " " + df["text"].fillna("")).tolist()
-        labels = df["label"].tolist()
-        print(f"[model] Loaded {len(texts)} samples.")
-        return texts, labels
-    print("[model] WARNING: Dataset not found, using fallback corpus.")
-    fake = [
-        "shocking secret government hiding truth exposed deep state plot uncovered",
-        "miracle cure doctors don't want you to know big pharma suppressing treatment",
-        "breaking exclusive leaked documents reveal massive conspiracy cover-up",
-        "wake up sheeple the truth about vaccines they are hiding from you",
-        "unbelievable bombshell corrupt officials caught red handed scandal exposed",
-    ]
-    real = [
-        "the senate passed the bipartisan infrastructure bill with 69 votes on tuesday",
-        "the federal reserve raised interest rates by 25 basis points citing inflation",
-        "researchers published peer reviewed findings in the new england journal of medicine",
-        "supreme court ruled in favor of upholding the affordable care act provisions",
-        "international climate summit concluded with new emissions reduction commitments",
-    ]
-    return fake + real, ["FAKE"] * len(fake) + ["REAL"] * len(real)
+class NaiveBayes:
+    def __init__(self):
+        self.log_priors = {}
+        self.log_likelihoods = {}
+        self.vocab = set()
 
-def _build_and_train():
-    texts, labels = _load_training_data()
-    pipe = Pipeline([
-        ("tfidf", TfidfVectorizer(
-            ngram_range=(1, 3),
-            max_features=100_000,
-            sublinear_tf=True,
-            min_df=2,
-            strip_accents="unicode",
-            analyzer="word",
-            token_pattern=r"\b[a-zA-Z][a-zA-Z0-9]{1,}\b",
-        )),
-        ("clf", LogisticRegression(
-            C=5.0,
-            max_iter=1000,
-            solver="lbfgs",
-            class_weight="balanced",
-            random_state=42,
-        )),
-    ])
-    pipe.fit(texts, labels)
-    return pipe
+    def _tokenize(self, text):
+        return re.findall(r"\b[a-z]{2,}\b", text.lower())
 
-if MODEL_PATH.exists():
-    print("[model] Loading pre-trained model from disk...")
-    pipeline = joblib.load(MODEL_PATH)
-    print("[model] Loaded.")
+    def fit(self, texts, labels):
+        counts = defaultdict(lambda: defaultdict(int))
+        class_totals = defaultdict(int)
+        class_counts = defaultdict(int)
+
+        for text, label in zip(texts, labels):
+            tokens = self._tokenize(text)
+            class_counts[label] += 1
+            for tok in tokens:
+                counts[label][tok] += 1
+                class_totals[label] += 1
+                self.vocab.add(tok)
+
+        total_docs = sum(class_counts.values())
+        vocab_size = len(self.vocab)
+
+        for label in class_counts:
+            self.log_priors[label] = math.log(class_counts[label] / total_docs)
+            self.log_likelihoods[label] = {}
+            for word in self.vocab:
+                # Laplace smoothing
+                self.log_likelihoods[label][word] = math.log(
+                    (counts[label][word] + 1) / (class_totals[label] + vocab_size)
+                )
+            # OOV token
+            self.log_likelihoods[label]["<OOV>"] = math.log(
+                1 / (class_totals[label] + vocab_size)
+            )
+
+    def predict_proba(self, text):
+        tokens = self._tokenize(text)
+        scores = {}
+        for label in self.log_priors:
+            score = self.log_priors[label]
+            ll = self.log_likelihoods[label]
+            for tok in tokens:
+                score += ll.get(tok, ll["<OOV>"])
+            scores[label] = score
+
+        # Convert log scores to probabilities via softmax
+        max_score = max(scores.values())
+        exp_scores = {k: math.exp(v - max_score) for k, v in scores.items()}
+        total = sum(exp_scores.values())
+        return {k: v / total for k, v in exp_scores.items()}
+
+
+def _load_csv_lightweight():
+    """Read CSV without pandas — saves ~100MB RAM."""
+    if not DATA_PATH.exists():
+        return None, None
+    texts, labels = [], []
+    with open(DATA_PATH, encoding="utf-8", errors="ignore") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            title = row.get("title", "")
+            text  = row.get("text", "")[:800]   # cap at 800 chars per article
+            label = row.get("label", "").strip().upper()
+            if label in ("FAKE", "REAL"):
+                texts.append(f"{title} {text}")
+                labels.append(label)
+    print(f"[model] Loaded {len(texts)} samples (lightweight CSV reader).")
+    return texts, labels
+
+
+print("[model] Training Naive Bayes...")
+_texts, _labels = _load_csv_lightweight()
+if _texts:
+    nb_model = NaiveBayes()
+    nb_model.fit(_texts, _labels)
+    print(f"[model] Trained. Vocab size: {len(nb_model.vocab)}")
 else:
-    print("[model] Training for first time (this takes ~30s)...")
-    pipeline = _build_and_train()
-    joblib.dump(pipeline, MODEL_PATH)
-    print(f"[model] Saved to {MODEL_PATH}")
-
-_ = pipeline.predict_proba(["warmup"])
-print("[model] Ready.")
+    print("[model] WARNING: No data, using fallback.")
+    nb_model = NaiveBayes()
+    nb_model.fit(
+        ["shocking conspiracy leaked deep state hoax rigged corrupt bombshell wake up sheeple",
+         "according to officials the senate passed the bill researchers published findings"],
+        ["FAKE", "REAL"]
+    )
 
 sentiment_analyzer = SentimentIntensityAnalyzer()
 
 # ---------------------------------------------------------------------------
-# Gemini AI client — replace key here when you get a new one
+# Gemini AI client
 # ---------------------------------------------------------------------------
 GEMINI_API_KEY = "AIzaSyAVKrIqWlon_NQOGtadqy4UTgOzWgfy5ZA"
 GEMINI_MODEL   = "models/gemini-2.0-flash-lite"
 _gemini_cache: dict[str, dict] = {}
 _gemini_last_call: float = 0.0
 
-GEMINI_PROMPT = """You are a professional fact-checker and media literacy expert.
-Analyze the following news article and determine if it is REAL or FAKE news.
+GEMINI_PROMPT = """You are a professional fact-checker. Analyze this news article and determine if it is REAL or FAKE.
 
-Respond ONLY with a valid JSON object in this exact format (no markdown, no extra text):
-{{
-  "prediction": "FAKE" or "REAL",
-  "confidence": <integer 50-99>,
-  "reasoning": "<one sentence explanation>",
-  "red_flags": ["<flag1>", "<flag2>"]
-}}
+Respond ONLY with valid JSON (no markdown):
+{{"prediction":"FAKE" or "REAL","confidence":<50-99>,"reasoning":"<one sentence>","red_flags":["<flag1>"]}}
 
 Article:
 {text}"""
@@ -161,29 +176,25 @@ Article:
 
 async def gemini_predict(text: str) -> dict | None:
     global _gemini_last_call
-    import time
+    import time, asyncio
 
     snippet = text[:1500]
     cache_key = hashlib.md5(snippet.encode()).hexdigest()
-
     if cache_key in _gemini_cache:
-        print("[gemini] cache hit")
         return _gemini_cache[cache_key]
 
     elapsed = time.time() - _gemini_last_call
     if elapsed < 4:
-        await __import__("asyncio").sleep(4 - elapsed)
+        await asyncio.sleep(4 - elapsed)
 
     try:
-        _client = google_genai.Client(api_key=GEMINI_API_KEY)
-        prompt = GEMINI_PROMPT.format(text=snippet)
-        response = _client.models.generate_content(
+        client = google_genai.Client(api_key=GEMINI_API_KEY)
+        response = client.models.generate_content(
             model=GEMINI_MODEL,
-            contents=prompt,
+            contents=GEMINI_PROMPT.format(text=snippet),
         )
         _gemini_last_call = time.time()
-        raw = response.text.strip()
-        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", response.text.strip(), flags=re.MULTILINE).strip()
         data = json.loads(raw)
         result = {
             "prediction": data.get("prediction", "FAKE").upper(),
@@ -192,7 +203,7 @@ async def gemini_predict(text: str) -> dict | None:
             "red_flags":  data.get("red_flags", []),
         }
         _gemini_cache[cache_key] = result
-        print(f"[gemini] success — {result['prediction']} {result['confidence']}%")
+        print(f"[gemini] {result['prediction']} {result['confidence']}%")
         return result
     except Exception as e:
         print(f"[gemini] unavailable: {e}")
@@ -205,102 +216,73 @@ def extract_bias_keywords(text: str) -> list[str]:
     lower = text.lower()
     return [kw for kw in BIAS_KEYWORDS if kw in lower]
 
-
 def get_sentiment(text: str) -> dict:
     scores = sentiment_analyzer.polarity_scores(text)
-    compound = scores["compound"]
-    label = "Positive" if compound >= 0.05 else "Negative" if compound <= -0.05 else "Neutral"
-    return {"score": round(compound, 3), "label": label, "detail": scores}
-
+    c = scores["compound"]
+    label = "Positive" if c >= 0.05 else "Negative" if c <= -0.05 else "Neutral"
+    return {"score": round(c, 3), "label": label, "detail": scores}
 
 def check_source(url: str) -> dict:
     try:
-        host = urlparse(url).hostname or ""
-        domain = host.removeprefix("www.")
+        domain = (urlparse(url).hostname or "").removeprefix("www.")
         return {"domain": domain, "verified": domain in CREDIBLE_DOMAINS}
     except Exception:
         return {"domain": "", "verified": False}
 
-
 def ml_predict(text: str) -> dict:
-    """ML prediction with strong rule-based override layer."""
-    proba = pipeline.predict_proba([text])[0]
-    classes = list(pipeline.classes_)
-    prob_real = float(proba[classes.index("REAL")])
-    prob_fake = float(proba[classes.index("FAKE")])
+    proba = nb_model.predict_proba(text)
+    prob_real = proba.get("REAL", 0.5)
+    prob_fake = proba.get("FAKE", 0.5)
 
     lower = text.lower()
-    bias_hits = len(extract_bias_keywords(text))
+    bias_hits   = len(extract_bias_keywords(text))
     factual_hits = sum(1 for m in FACTUAL_MARKERS if m in lower)
-    sentiment = get_sentiment(text)
-    word_count = len(text.split())
-    caps_words = len(re.findall(r'\b[A-Z]{3,}\b', text))
+    sentiment   = get_sentiment(text)
+    caps_words  = len(re.findall(r'\b[A-Z]{3,}\b', text))
 
-    # -----------------------------------------------------------------------
-    # RULE LAYER — these override the ML when signals are strong
-    # -----------------------------------------------------------------------
-
-    # FAKE signals (strong)
+    # Rule overrides
     if bias_hits >= 5:
         prob_fake = max(prob_fake, 0.95)
-        prob_real = 1 - prob_fake
     elif bias_hits >= 3:
         prob_fake = max(prob_fake, 0.88)
-        prob_real = 1 - prob_fake
     elif bias_hits >= 1:
-        prob_fake = max(prob_fake, prob_fake + 0.08)
-        prob_real = 1 - prob_fake
+        prob_fake = max(prob_fake, prob_fake + 0.06)
 
-    # Clickbait caps + short text
-    if caps_words >= 4 and word_count < 300:
+    if caps_words >= 4 and len(text.split()) < 300:
         prob_fake = max(prob_fake, 0.82)
-        prob_real = 1 - prob_fake
 
-    # Highly emotional negative + bias = fake
     if sentiment["score"] < -0.5 and bias_hits >= 2:
         prob_fake = max(prob_fake, 0.85)
-        prob_real = 1 - prob_fake
 
-    # REAL signals (strong) — factual language with no bias overrides ML
     if bias_hits == 0 and factual_hits >= 6:
         prob_real = max(prob_real, 0.92)
-        prob_fake = 1 - prob_real
     elif bias_hits == 0 and factual_hits >= 4:
         prob_real = max(prob_real, 0.85)
-        prob_fake = 1 - prob_real
     elif bias_hits == 0 and factual_hits >= 2:
         prob_real = max(prob_real, 0.75)
-        prob_fake = 1 - prob_real
     elif bias_hits == 0 and factual_hits >= 1:
-        # Mild nudge toward real when no bias at all
-        prob_real = max(prob_real, 0.60)
-        prob_fake = 1 - prob_real
+        prob_real = max(prob_real, 0.62)
 
-    # Normalize
+    prob_fake = 1 - prob_real if prob_real > 0.5 else prob_fake
+    prob_real = 1 - prob_fake if prob_fake > 0.5 else prob_real
     total = prob_real + prob_fake
     prob_real /= total
     prob_fake /= total
 
     label = "REAL" if prob_real >= 0.5 else "FAKE"
-    confidence = round(prob_real * 100, 1) if label == "REAL" else round(prob_fake * 100, 1)
+    confidence = round((prob_real if label == "REAL" else prob_fake) * 100, 1)
 
-    # Build reasoning
     if label == "FAKE":
         reasons = []
-        if bias_hits > 0:
-            reasons.append(f"{bias_hits} sensational keyword(s) detected")
-        if caps_words >= 4:
-            reasons.append("excessive capitalization (clickbait pattern)")
-        if sentiment["score"] < -0.4:
-            reasons.append("highly negative emotional tone")
-        reasoning = "Flagged as likely fake: " + ("; ".join(reasons) if reasons else "ML model pattern match.")
+        if bias_hits: reasons.append(f"{bias_hits} sensational keyword(s)")
+        if caps_words >= 4: reasons.append("excessive capitalization")
+        if sentiment["score"] < -0.4: reasons.append("highly negative tone")
+        reasoning = "Flagged as likely fake: " + ("; ".join(reasons) or "ML pattern match.")
     else:
         reasons = []
-        if factual_hits >= 2:
-            reasons.append(f"{factual_hits} factual language markers found")
-        if bias_hits == 0:
-            reasons.append("no sensational keywords detected")
-        reasoning = "Appears credible: " + ("; ".join(reasons) if reasons else "ML model pattern match.")
+        if factual_hits >= 2: reasons.append(f"{factual_hits} factual markers")
+        if bias_hits == 0: reasons.append("no sensational keywords")
+        reasoning = "Appears credible: " + ("; ".join(reasons) or "ML pattern match.")
 
     return {
         "prediction":     label,
@@ -315,27 +297,22 @@ def ml_predict(text: str) -> dict:
         "engine":         "ml",
     }
 
-
 async def run_prediction(text: str) -> dict:
-    # Try Gemini first
     ai = await gemini_predict(text)
-
     if ai:
         prob_real = ai["confidence"] / 100 if ai["prediction"] == "REAL" else 1 - ai["confidence"] / 100
         return {
-            "prediction":   ai["prediction"],
-            "confidence":   ai["confidence"],
-            "prob_real":    round(prob_real * 100, 1),
-            "prob_fake":    round((1 - prob_real) * 100, 1),
-            "reasoning":    ai["reasoning"],
-            "red_flags":    ai["red_flags"],
-            "sentiment":    get_sentiment(text),
+            "prediction":     ai["prediction"],
+            "confidence":     ai["confidence"],
+            "prob_real":      round(prob_real * 100, 1),
+            "prob_fake":      round((1 - prob_real) * 100, 1),
+            "reasoning":      ai["reasoning"],
+            "red_flags":      ai["red_flags"],
+            "sentiment":      get_sentiment(text),
             "flagged_tokens": extract_bias_keywords(text),
-            "source_status": None,
-            "engine":       "gemini",
+            "source_status":  None,
+            "engine":         "gemini",
         }
-
-    # Fallback: improved ML model
     return ml_predict(text)
 
 # ---------------------------------------------------------------------------
@@ -347,23 +324,20 @@ class TextRequest(BaseModel):
 class UrlRequest(BaseModel):
     url: str
 
-
 @app.post("/analyze/text")
 async def analyze_text(req: TextRequest):
     if len(req.text.strip()) < 20:
-        raise HTTPException(status_code=400, detail="Text too short to analyze.")
+        raise HTTPException(status_code=400, detail="Text too short.")
     return await run_prediction(req.text)
-
 
 @app.post("/analyze/headline")
 async def analyze_headline(req: TextRequest):
     first = re.split(r"(?<=[.!?])\s", req.text.strip())[0]
     if len(first.strip()) < 10:
-        raise HTTPException(status_code=400, detail="Could not extract a headline.")
+        raise HTTPException(status_code=400, detail="Could not extract headline.")
     result = await run_prediction(first)
     result["headline"] = first
     return result
-
 
 @app.post("/analyze/url")
 async def analyze_url(req: UrlRequest):
@@ -374,27 +348,17 @@ async def analyze_url(req: UrlRequest):
             resp.raise_for_status()
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not fetch URL: {e}")
-
     soup = BeautifulSoup(resp.text, "html.parser")
-    paragraphs = soup.find_all(["p", "article"])
-    text = " ".join(p.get_text() for p in paragraphs)
-
+    text = " ".join(p.get_text() for p in soup.find_all(["p", "article"]))
     if len(text.strip()) < 20:
-        raise HTTPException(status_code=400, detail="Could not extract enough text from URL.")
-
+        raise HTTPException(status_code=400, detail="Could not extract text from URL.")
     result = await run_prediction(text)
     result["source_status"] = source
     return result
 
-
 @app.get("/status")
 async def status():
-    return {
-        "status": "ok",
-        "cache_size": len(_gemini_cache),
-        "model": GEMINI_MODEL,
-        "gemini_key_set": bool(GEMINI_API_KEY),
-    }
+    return {"status": "ok", "vocab_size": len(nb_model.vocab), "model": "NaiveBayes+rules"}
 
 @app.post("/cache/clear")
 async def clear_cache():
