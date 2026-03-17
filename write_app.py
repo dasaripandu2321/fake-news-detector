@@ -11,7 +11,7 @@ w('import { motion, AnimatePresence } from "framer-motion";')
 w('import { jsPDF } from "jspdf";')
 w('import { Search, Link2, Trash2, Clock, ChevronRight, Shield, Zap, AlertTriangle, CheckCircle, Copy, Download, ExternalLink, Menu, X } from "lucide-react";')
 w('')
-w('const API = import.meta.env.VITE_API_URL || "http://localhost:8000";')
+w('const API = import.meta.env.VITE_API_URL || "https://fake-news-detector-1uxs.onrender.com";')
 w('const MAX_HISTORY = 8;')
 w('')
 
