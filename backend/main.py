@@ -122,6 +122,10 @@ pipeline = Pipeline([
 pipeline.fit(_texts, _labels)
 print("[model] Training complete (LogisticRegression).")
 
+# Warm up — ensures model is ready before first request
+_ = pipeline.predict_proba(["test warmup text"])
+print("[model] Warmup done.")
+
 sentiment_analyzer = SentimentIntensityAnalyzer()
 
 # ---------------------------------------------------------------------------
