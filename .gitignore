@@ -6,6 +6,7 @@ __pycache__/
 venv/
 .venv/
 *.egg-info/
+backend/model.pkl
 
 # Node
 node_modules/

@@ -6,7 +6,7 @@ from bs4 import BeautifulSoup
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
-from sklearn.model_selection import cross_val_score
+import joblib
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from google import genai as google_genai
 import numpy as np
@@ -69,16 +69,17 @@ FACTUAL_MARKERS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Train on real labeled dataset (fake_or_real_news.csv — 6335 articles)
+# Model — train once, save to disk, reload on subsequent boots (saves RAM/CPU)
 # ---------------------------------------------------------------------------
-DATA_PATH = Path(__file__).parent / "data" / "fake_or_real_news.csv"
+DATA_PATH  = Path(__file__).parent / "data" / "fake_or_real_news.csv"
+MODEL_PATH = Path(__file__).parent / "model.pkl"
 
 def _load_training_data():
     if DATA_PATH.exists():
         df = pd.read_csv(DATA_PATH)
         texts = (df["title"].fillna("") + " " + df["text"].fillna("")).tolist()
         labels = df["label"].tolist()
-        print(f"[model] Loaded {len(texts)} samples from dataset.")
+        print(f"[model] Loaded {len(texts)} samples.")
         return texts, labels
     print("[model] WARNING: Dataset not found, using fallback corpus.")
     fake = [
@@ -97,34 +98,41 @@ def _load_training_data():
     ]
     return fake + real, ["FAKE"] * len(fake) + ["REAL"] * len(real)
 
-_texts, _labels = _load_training_data()
+def _build_and_train():
+    texts, labels = _load_training_data()
+    pipe = Pipeline([
+        ("tfidf", TfidfVectorizer(
+            ngram_range=(1, 3),
+            max_features=100_000,
+            sublinear_tf=True,
+            min_df=2,
+            strip_accents="unicode",
+            analyzer="word",
+            token_pattern=r"\b[a-zA-Z][a-zA-Z0-9]{1,}\b",
+        )),
+        ("clf", LogisticRegression(
+            C=5.0,
+            max_iter=1000,
+            solver="lbfgs",
+            class_weight="balanced",
+            random_state=42,
+        )),
+    ])
+    pipe.fit(texts, labels)
+    return pipe
 
-# Use LogisticRegression — much better calibrated probabilities than SGD
-pipeline = Pipeline([
-    ("tfidf", TfidfVectorizer(
-        ngram_range=(1, 3),
-        max_features=100_000,
-        sublinear_tf=True,
-        min_df=2,
-        strip_accents="unicode",
-        analyzer="word",
-        token_pattern=r"\b[a-zA-Z][a-zA-Z0-9]{1,}\b",
-    )),
-    ("clf", LogisticRegression(
-        C=5.0,
-        max_iter=1000,
-        solver="lbfgs",
-        class_weight="balanced",
-        random_state=42,
-    )),
-])
+if MODEL_PATH.exists():
+    print("[model] Loading pre-trained model from disk...")
+    pipeline = joblib.load(MODEL_PATH)
+    print("[model] Loaded.")
+else:
+    print("[model] Training for first time (this takes ~30s)...")
+    pipeline = _build_and_train()
+    joblib.dump(pipeline, MODEL_PATH)
+    print(f"[model] Saved to {MODEL_PATH}")
 
-pipeline.fit(_texts, _labels)
-print("[model] Training complete (LogisticRegression).")
-
-# Warm up — ensures model is ready before first request
-_ = pipeline.predict_proba(["test warmup text"])
-print("[model] Warmup done.")
+_ = pipeline.predict_proba(["warmup"])
+print("[model] Ready.")
 
 sentiment_analyzer = SentimentIntensityAnalyzer()
 
